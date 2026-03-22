@@ -1,10 +1,11 @@
 /**
- * CV Workflow - Complete Integration
+ * CV Workflow using Puppeteer for PDF Generation
  *
  * Main workflow:
  * 1. Get CV JSON data from chrome.storage
- * 2. Generate PDF directly from CV data
- * 3. Upload PDF to form inputs
+ * 2. Generate HTML from CV data
+ * 3. Use Puppeteer (via chrome.debugger) to create PDF
+ * 4. Upload PDF to form inputs
  */
 
 import { getCVData } from './storageHelpers'
@@ -14,11 +15,7 @@ import {
   getCVStats,
   type CVData
 } from './latexGenerator'
-import {
-  generatePDFWithPuppeteer,
-  getPDFSize,
-  pdfBlobToBase64
-} from './puppeteerPDFGenerator'
+import { generateHTMLCV } from './cvHTMLTemplate'
 
 // ============================================
 // Types
@@ -34,7 +31,7 @@ export interface CVWorkflowOptions {
 export interface CVWorkflowResult {
   success: boolean
   stagesCompleted: string[]
-  pdfBlob?: Blob
+  pdfBase64?: string
   pdfSize?: string
   uploadStats?: {
     uploaded: number
@@ -48,7 +45,8 @@ export interface CVWorkflowResult {
 // ============================================
 
 /**
- * Complete CV workflow: JSON → LaTeX → PDF → Upload
+ * Complete CV workflow: JSON → HTML → PDF → Upload
+ * Uses Puppeteer via chrome.debugger for PDF generation
  */
 export async function executeCVWorkflow(
   options: CVWorkflowOptions = {}
@@ -78,23 +76,20 @@ export async function executeCVWorkflow(
       return result
     }
 
-    progress('STORAGE', `✓ CV data loaded (${JSON.stringify(cvData).length} bytes)`)
+    progress('STORAGE', `✓ CV data loaded`)
 
     // Enhance education data with estimated start dates if missing
     if (cvData.education && Array.isArray(cvData.education)) {
       cvData.education = cvData.education.map((edu: any) => {
-        // If startDate already exists, keep it
         if (edu.startDate) {
           return edu
         }
 
-        // Estimate startDate from graduationYear
         if (edu.graduationYear) {
           const gradYear = parseInt(edu.graduationYear.toString())
           if (!isNaN(gradYear)) {
-            // Estimate duration based on degree type
             const degree = (edu.degree || '').toLowerCase()
-            let estimatedYears = 4 // Default for bachelor's
+            let estimatedYears = 4
 
             if (degree.includes('master') || degree.includes('mtech') || degree.includes('ms') || degree.includes('m.sc')) {
               estimatedYears = 2
@@ -107,7 +102,6 @@ export async function executeCVWorkflow(
             }
 
             const startYear = gradYear - estimatedYears
-            // Use August as typical start month
             return { ...edu, startDate: `${startYear}-08` }
           }
         }
@@ -137,11 +131,11 @@ export async function executeCVWorkflow(
     result.stagesCompleted.push('storage')
 
     // ========================================
-    // Stage 2: Compile PDF directly from CV data
+    // Stage 2: Generate PDF using Puppeteer
     // ========================================
     progress('PDF', 'Generating CV PDF with Puppeteer...')
 
-    const compileResult = await generatePDFWithPuppeteer(cvData as any, {
+    const pdfResult = await generatePDFWithPuppeteer(cvData, {
       filename: options.filename || 'cv.pdf',
       format: 'A4',
       printBackground: true,
@@ -153,41 +147,43 @@ export async function executeCVWorkflow(
       }
     })
 
-    if (!compileResult.success || !compileResult.pdfBlob) {
-      const error = compileResult.error || 'Failed to compile PDF'
+    if (!pdfResult.success || !pdfResult.pdfBase64) {
+      const error = pdfResult.error || 'Failed to generate PDF'
       progress('ERROR', error)
       options.onError?.(error)
       result.error = error
       return result
     }
 
-    console.log('[CV Workflow] compileResult.pdfBlob:', compileResult.pdfBlob)
-    console.log('[CV Workflow] compileResult.pdfBlob size:', compileResult.pdfBlob?.size)
-    console.log('[CV Workflow] compileResult.pdfBlob type:', compileResult.pdfBlob?.type)
+    progress('PDF', `✓ PDF generated successfully (${pdfResult.pdfSize})`)
 
-    const pdfSize = getPDFSize(compileResult.pdfBlob)
-    progress('PDF', `✓ PDF compiled successfully (${pdfSize})`)
-
-    result.pdfBlob = compileResult.pdfBlob
-    result.pdfSize = pdfSize
+    result.pdfBase64 = pdfResult.pdfBase64
+    result.pdfSize = pdfResult.pdfSize
     result.stagesCompleted.push('pdf')
 
-    console.log('[CV Workflow] result.pdfBlob set:', result.pdfBlob)
-    console.log('[CV Workflow] result.pdfBlob size:', result.pdfBlob?.size)
+    console.log('[CV Workflow] PDF generated, size:', pdfResult.pdfSize)
 
     // ========================================
-    // Stage 4: Upload to Form Inputs (if enabled)
+    // Stage 3: Upload to Form Inputs (if enabled)
     // ========================================
     if (options.autoUpload !== false) {
       progress('UPLOAD', 'Uploading PDF to form inputs...')
 
       try {
-        // Import FileUploader dynamically to avoid circular dependencies
+        // Convert base64 to blob for upload
+        const binaryString = atob(pdfResult.pdfBase64)
+        const bytes = new Uint8Array(binaryString.length)
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i)
+        }
+        const pdfBlob = new Blob([bytes], { type: 'application/pdf' })
+
+        // Import FileUploader dynamically
         const { getFileUploader } = await import('../contentScript/core/FileUploader')
         const uploader = getFileUploader()
 
         const uploadResult = await uploader.uploadCVToAllInputs(
-          compileResult.pdfBlob,
+          pdfBlob,
           options.filename || 'cv.pdf'
         )
 
@@ -205,7 +201,6 @@ export async function executeCVWorkflow(
       } catch (uploadError) {
         const error = uploadError instanceof Error ? uploadError.message : 'Upload failed'
         progress('UPLOAD_WARNING', `Upload failed: ${error}`)
-        // Don't fail the entire workflow if upload fails
         result.uploadStats = {
           uploaded: 0,
           errors: [error]
@@ -221,15 +216,6 @@ export async function executeCVWorkflow(
     result.success = true
     progress('SUCCESS', 'CV workflow completed successfully!')
 
-    console.log('[CV Workflow] Returning result:', {
-      success: result.success,
-      hasPdfBlob: !!result.pdfBlob,
-      pdfSize: result.pdfSize,
-      stagesCompleted: result.stagesCompleted,
-      pdfBlobType: result.pdfBlob?.type,
-      pdfBlobSize: result.pdfBlob?.size
-    })
-
     return result
 
   } catch (error) {
@@ -238,6 +224,108 @@ export async function executeCVWorkflow(
     options.onError?.(errorMessage)
     result.error = errorMessage
     return result
+  }
+}
+
+// ============================================
+// Puppeteer PDF Generation
+// ============================================
+
+/**
+ * Generate PDF from CV data using Puppeteer (chrome.debugger)
+ */
+async function generatePDFWithPuppeteer(
+  cvData: any,
+  options: {
+    filename?: string
+    format?: 'A4' | 'Letter'
+    printBackground?: boolean
+    margin?: {
+      top?: string
+      bottom?: string
+      left?: string
+      right?: string
+    }
+  }
+): Promise<{ success: boolean; pdfBase64?: string; pdfSize?: string; error?: string }> {
+  try {
+    console.log('[Puppeteer PDF] Starting PDF generation...')
+
+    // Generate HTML from CV data
+    const html = generateHTMLCV(cvData)
+    console.log('[Puppeteer PDF] HTML generated:', html.length, 'bytes')
+
+    // Create data URL
+    const dataUrl = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`
+
+    // Create new tab
+    const tab = await chrome.tabs.create({ url: dataUrl, active: false })
+    console.log('[Puppeteer PDF] Tab created:', tab.id)
+
+    // Wait for tab to fully load and render
+    await new Promise(resolve => setTimeout(resolve, 3000))
+
+    // Attach debugger
+    await chrome.debugger.attach({ tabId: tab.id! }, '1.3')
+    console.log('[Puppeteer PDF] Debugger attached')
+
+    try {
+      // Enable Page domain first
+      await chrome.debugger.sendCommand({ tabId: tab.id! }, 'Page.enable')
+      console.log('[Puppeteer PDF] Page domain enabled')
+
+      // Wait a bit more for rendering
+      await new Promise(resolve => setTimeout(resolve, 1000))
+
+      // Generate PDF using Page.printToPDF
+      const result = await chrome.debugger.sendCommand(
+        { tabId: tab.id! },
+        'Page.printToPDF',
+        {
+          landscape: false,
+          displayHeaderFooter: false,
+          printBackground: options.printBackground !== false,
+          preferCSSPageSize: false,
+          paperWidth: 8.27, // A4 width in inches
+          paperHeight: 11.69, // A4 height in inches
+          marginTop: 0.4,
+          marginBottom: 0.4,
+          marginLeft: 0.4,
+          marginRight: 0.4
+        }
+      ) as { data: string }
+
+      console.log('[Puppeteer PDF] PDF generated:', result.data.length, 'chars')
+
+      // Close tab
+      await chrome.tabs.remove(tab.id!)
+
+      // Calculate size
+      const binaryString = atob(result.data)
+      const sizeKB = (binaryString.length / 1024).toFixed(2)
+      const sizeStr = sizeKB + ' KB'
+
+      return {
+        success: true,
+        pdfBase64: result.data,
+        pdfSize: sizeStr
+      }
+
+    } finally {
+      // Always detach debugger
+      try {
+        await chrome.debugger.detach({ tabId: tab.id! })
+      } catch (e) {
+        console.warn('[Puppeteer PDF] Detach warning:', e)
+      }
+    }
+
+  } catch (error) {
+    console.error('[Puppeteer PDF] Error:', error)
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
+    }
   }
 }
 
@@ -258,62 +346,32 @@ export async function generateAndDownloadCV(
     onProgress
   })
 
-  // Note: Don't call downloadPDFBlob here as it uses URL.createObjectURL
-  // which is not available in background scripts. The frontend will handle
-  // the download after receiving the PDF blob.
+  // Download the PDF if successful
+  if (result.success && result.pdfBase64) {
+    try {
+      const binaryString = atob(result.pdfBase64)
+      const bytes = new Uint8Array(binaryString.length)
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i)
+      }
+      const blob = new Blob([bytes], { type: 'application/pdf' })
+
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+
+      console.log('[CV Workflow] PDF downloaded successfully!')
+    } catch (error) {
+      console.error('[CV Workflow] Failed to download PDF:', error)
+    }
+  }
 
   return result
-}
-
-/**
- * Generate CV PDF only (no download, no upload)
- */
-export async function generateCVPDF(
-  onProgress?: (stage: string, message: string) => void
-): Promise<CVWorkflowResult> {
-  return executeCVWorkflow({
-    autoUpload: false,
-    onProgress
-  })
-}
-
-/**
- * Quick check if CV workflow can be executed
- */
-export async function canExecuteCVWorkflow(): Promise<{
-  canExecute: boolean
-  hasCVData: boolean
-  hasMinimumData: boolean
-  reason?: string
-}> {
-  const cvData = await getCVData()
-
-  if (!cvData) {
-    return {
-      canExecute: false,
-      hasCVData: false,
-      hasMinimumData: false,
-      reason: 'No CV data found in storage'
-    }
-  }
-
-  if (!validateCVData(cvData)) {
-    return {
-      canExecute: false,
-      hasCVData: true,
-      hasMinimumData: false,
-      reason: 'CV data has invalid structure'
-    }
-  }
-
-  const hasMinimum = hasMinimumCVData(cvData as CVData)
-
-  return {
-    canExecute: true,
-    hasCVData: true,
-    hasMinimumData: hasMinimum,
-    reason: hasMinimum ? undefined : 'CV data may be incomplete'
-  }
 }
 
 // ============================================
@@ -322,7 +380,6 @@ export async function canExecuteCVWorkflow(): Promise<{
 
 /**
  * Handle messages from popup/content script
- * This can be called from chrome.runtime.onMessage
  */
 export async function handleCVWorkflowMessage(
   message: any,
@@ -333,26 +390,45 @@ export async function handleCVWorkflowMessage(
 
   try {
     switch (message.action) {
-      case 'generateCV':
+      case 'generateCV': {
+        const result = await generateAndDownloadCV(
+          message.filename || 'cv.pdf'
+        )
+
+        console.log('[CV Workflow] generateCV result:', {
+          success: result.success,
+          hasPdfBase64: !!result.pdfBase64,
+          pdfSize: result.pdfSize,
+          stagesCompleted: result.stagesCompleted
+        })
+
+        sendResponse?.(result)
+        break
+      }
+
       case 'generateAndUploadCV': {
-        sendResponse?.({ success: false, error: 'PDF generation is no longer supported in the background script. Use frontend generators.' })
+        const result = await executeCVWorkflow({
+          filename: message.filename || 'cv.pdf',
+          autoUpload: true,
+          onProgress: (stage, msg) => {
+            chrome.runtime.sendMessage({
+              type: 'cv_workflow_progress',
+              stage,
+              message: msg
+            }).catch(() => {})
+          }
+        })
+
+        sendResponse?.(result)
         break
       }
 
       case 'checkCVData': {
-        const check = await canExecuteCVWorkflow()
-        sendResponse?.(check)
-        break
-      }
-
-      case 'getCVStats': {
         const cvData = await getCVData()
-        if (cvData) {
-          const stats = getCVStats(cvData as CVData)
-          sendResponse?.({ success: true, stats })
-        } else {
-          sendResponse?.({ success: false, error: 'No CV data found' })
-        }
+        sendResponse?.({
+          hasCVData: !!cvData,
+          valid: cvData ? validateCVData(cvData) : false
+        })
         break
       }
 
@@ -368,24 +444,19 @@ export async function handleCVWorkflowMessage(
   }
 }
 
-// ============================================
-// Setup Message Listener
-// ============================================
-
 /**
  * Initialize CV workflow message listener in background script
- * Call this from background/index.ts
  */
 export function setupCVWorkflowListener(): void {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    // Handle CV workflow messages asynchronously
-    if (message.action === 'checkCVData' ||
+    if (message.action?.startsWith('generateCV') ||
+      message.action === 'checkCVData' ||
       message.action === 'getCVStats') {
       handleCVWorkflowMessage(message, sender, sendResponse)
-      return true // Keep message channel open for async response
+      return true
     }
     return false
   })
 
-  console.log('[CV Workflow] Message listener initialized')
+  console.log('[CV Workflow] Message listener initialized (Puppeteer-based)')
 }
